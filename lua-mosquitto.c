@@ -36,6 +36,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <assert.h>
 
@@ -43,6 +44,7 @@
 #include <lualib.h>
 #include <lauxlib.h>
 
+#include <pthread.h>
 #include <mosquitto.h>
 
 #include "compat.h"
@@ -67,6 +69,13 @@ enum connect_return_codes {
 	CONN_REF_BAD_TLS
 };
 
+#define MLUA_MEMORDER         __ATOMIC_SEQ_CST
+#define MLUA_LOCK_DISABLE     0x12345678
+#define MLUA_LOCK_ENABLED     0x98765432
+struct mlua_lock {
+	unsigned int ml_enable;
+	pthread_mutex_t ml_lock;
+};
 /* unique naming for userdata metatables */
 #define MOSQ_META_CTX	"mosquitto.ctx"
 
@@ -83,6 +92,103 @@ typedef struct {
 } ctx_t;
 
 static int mosq_initialized = 0;
+static struct mlua_lock glua_lock;
+
+static int mlua_lock_unlock(int dolock, int doabort)
+{
+	int ret;
+	unsigned int enaval;
+	struct mlua_lock * mlock;
+
+	enaval = 0;
+	mlock = &glua_lock;
+	__atomic_load(&mlock->ml_enable, &enaval, MLUA_MEMORDER);
+	if (enaval == MLUA_LOCK_DISABLE)
+		return 0;
+
+	if (enaval != MLUA_LOCK_ENABLED) {
+		fprintf(stderr, "Error, invalid lua lock: %#x\n", enaval);
+		fflush(stderr);
+		if (doabort)
+			abort();
+		return -1;
+	}
+
+	if (dolock != 0)
+		ret = pthread_mutex_lock(&mlock->ml_lock);
+	else
+		ret = pthread_mutex_unlock(&mlock->ml_lock);
+	if (ret) {
+		fprintf(stderr, "Error, failed to %s lua lock: %d\n",
+			dolock ? "acquire" : "release", ret);
+		fflush(stderr);
+		if (doabort)
+			abort();
+		return -2;
+	}
+	return 0;
+
+}
+
+static int mlua_do_lock(void)
+{
+	return mlua_lock_unlock(1, 1);
+}
+
+static int mlua_do_unlock(void)
+{
+	return mlua_lock_unlock(0, 1);
+}
+
+static int mosq_lock(lua_State *L)
+{
+	int enabled;
+	int ntop, rval;
+	struct mlua_lock * mlock;
+
+	enabled = 0;
+	mlock = &glua_lock;
+	__atomic_load(&mlock->ml_enable, &enabled, MLUA_MEMORDER);
+
+	/* check `ml_enable, which only has two possible values: */
+	if (enabled != MLUA_LOCK_DISABLE && enabled != MLUA_LOCK_ENABLED) {
+		fprintf(stderr, "Error, invalid lua lock: %#x\n", enabled);
+		fflush(stderr);
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+	ntop = lua_gettop(L);
+	rval = enabled == MLUA_LOCK_ENABLED;
+	if (ntop >= 1 && lua_type(L, 1) == LUA_TBOOLEAN) {
+		int ret = 0, enaval;
+		int dolock = lua_toboolean(L, 1);
+		if (dolock && (enabled == MLUA_LOCK_DISABLE)) {
+			ret = pthread_mutex_lock(&mlock->ml_lock);
+			if (ret == 0) {
+				enaval = MLUA_LOCK_ENABLED;
+				__atomic_store(&mlock->ml_enable, &enaval, MLUA_MEMORDER);
+				rval = 1;
+			}
+		} else if (dolock == 0 && (enabled == MLUA_LOCK_ENABLED)) {
+			rval = 0;
+			enaval = MLUA_LOCK_DISABLE;
+			__atomic_store(&mlock->ml_enable, &enaval, MLUA_MEMORDER);
+			ret = pthread_mutex_unlock(&mlock->ml_lock);
+		}
+		if (ret) {
+			fprintf(stderr, "Error, failed to %s lua lock: %d\n",
+				dolock ? "acquire" : "release", ret);
+			fflush(stderr);
+			lua_pushboolean(L, 0);
+			return 1;
+		}
+	}
+
+	lua_pushboolean(L, 1);
+	lua_pushboolean(L, rval);
+	return 2;
+}
 
 /* handle mosquitto lib return codes */
 static int mosq__pstatus(lua_State *L, int mosq_errno) {
@@ -179,8 +285,11 @@ static int mosq_topic_matches_sub(lua_State *L)
 */
 static int mosq_init(lua_State *L)
 {
-	if (!mosq_initialized)
+	if (!mosq_initialized) {
+		mlua_do_unlock();
 		mosquitto_lib_init();
+		mlua_do_lock();
+	}
 
 	return mosq__pstatus(L, MOSQ_ERR_SUCCESS);
 }
@@ -199,7 +308,9 @@ static int mosq_init(lua_State *L)
  */
 static int mosq_cleanup(lua_State *L)
 {
+	mlua_do_unlock();
 	mosquitto_lib_cleanup();
+	mlua_do_lock();
 	mosq_initialized = 0;
 	return mosq__pstatus(L, MOSQ_ERR_SUCCESS);
 }
@@ -246,8 +357,10 @@ static int mosq_new(lua_State *L)
 
 	ctx_t *ctx = (ctx_t *) lua_newuserdata(L, sizeof(ctx_t));
 
+	mlua_do_unlock();
 	/* ctx will be passed as void *obj arg in the callback functions */
 	ctx->mosq = mosquitto_new(id, clean_session, ctx);
+	mlua_do_lock();
 
 	if (ctx->mosq == NULL) {
 		return luaL_error(L, strerror(errno));
@@ -287,7 +400,9 @@ static ctx_t * ctx_check(lua_State *L, int i)
 static int ctx_destroy(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
+	mlua_do_unlock();
 	mosquitto_destroy(ctx->mosq);
+	mlua_do_lock();
 
 	/* clean up Lua callback functions in the registry */
 	ctx__on_clear(ctx);
@@ -322,7 +437,9 @@ static int ctx_reinitialise(lua_State *L)
 		return luaL_argerror(L, 3, "if 'id' is nil then 'clean session' must be true");
 	}
 
+	mlua_do_unlock();
 	int rc = mosquitto_reinitialise(ctx->mosq, id, clean_session, ctx);
+	mlua_do_lock();
 
 	/* clean up Lua callback functions in the registry */
 	ctx__on_clear(ctx);
@@ -359,7 +476,9 @@ static int ctx_will_set(lua_State *L)
 	int qos = luaL_optinteger(L, 4, 0);
 	bool retain = lua_toboolean(L, 5);
 
+	mlua_do_unlock();
 	int rc = mosquitto_will_set(ctx->mosq, topic, payloadlen, payload, qos, retain);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -377,7 +496,9 @@ static int ctx_will_clear(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_will_clear(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -399,7 +520,9 @@ static int ctx_login_set(lua_State *L)
 	const char *username = (lua_isnil(L, 2) ? NULL : luaL_checkstring(L, 2));
 	const char *password = (lua_isnil(L, 3) ? NULL : luaL_checkstring(L, 3));
 
+	mlua_do_unlock();
 	int rc = mosquitto_username_pw_set(ctx->mosq, username, password);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -428,7 +551,9 @@ static int ctx_tls_set(lua_State *L)
 
 	// the last param is a callback to a function that asks for a passphrase for a keyfile
 	// our keyfiles should NOT have a passphrase
+	mlua_do_unlock();
 	int rc = mosquitto_tls_set(ctx->mosq, cafile, capath, certfile, keyfile, 0);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -448,7 +573,9 @@ static int ctx_tls_insecure_set(lua_State *L)
 	ctx_t *ctx = ctx_check(L, 1);
 	bool value = lua_toboolean(L, 2);
 
+	mlua_do_unlock();
 	int rc = mosquitto_tls_insecure_set(ctx->mosq, value);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -472,7 +599,9 @@ static int ctx_tls_psk_set(lua_State *L)
 	const char *identity = luaL_checkstring(L, 3);
 	const char *ciphers = luaL_optstring(L, 4, NULL);
 
+	mlua_do_unlock();
 	int rc = mosquitto_tls_psk_set(ctx->mosq, psk, identity, ciphers);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -496,7 +625,9 @@ static int ctx_tls_opts_set(lua_State *L)
 	const char *tls_version = luaL_optstring(L, 3, NULL);
 	const char *ciphers = luaL_optstring(L, 4, NULL);
 
+	mlua_do_unlock();
 	int rc = mosquitto_tls_opts_set(ctx->mosq, cert_required ? 1 : 0, tls_version, ciphers);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -516,7 +647,9 @@ static int ctx_threaded_set(lua_State *L)
 	ctx_t *ctx = ctx_check(L, 1);
 	bool value = lua_toboolean(L, 2);
 
+	mlua_do_unlock();
 	int rc = mosquitto_threaded_set(ctx->mosq, value);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -545,10 +678,14 @@ static int ctx_option(lua_State *L)
 
 	if (type == LUA_TNUMBER) {
 		int val = lua_tonumber(L, 3);
+		mlua_do_unlock();
 		rc = mosquitto_int_option(ctx->mosq, option, val);
+		mlua_do_lock();
 	} else if (type == LUA_TSTRING) {
 		const char *val = lua_tolstring(L, 3, NULL);
+		mlua_do_unlock();
 		rc = mosquitto_string_option(ctx->mosq, option, val);
+		mlua_do_lock();
 	} else {
 		return luaL_argerror(L, 3, "values must be numeric or string");
 	}
@@ -575,7 +712,9 @@ static int ctx_connect(lua_State *L)
 	int port = luaL_optinteger(L, 3, 1883);
 	int keepalive = luaL_optinteger(L, 4, 60);
 
+	mlua_do_unlock();
 	int rc =  mosquitto_connect(ctx->mosq, host, port, keepalive);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -599,7 +738,9 @@ static int ctx_connect_async(lua_State *L)
 	int port = luaL_optinteger(L, 3, 1883);
 	int keepalive = luaL_optinteger(L, 4, 60);
 
+	mlua_do_unlock();
 	int rc =  mosquitto_connect_async(ctx->mosq, host, port, keepalive);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -616,7 +757,9 @@ static int ctx_reconnect(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_reconnect(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -633,7 +776,9 @@ static int ctx_reconnect_async(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_reconnect_async(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -650,7 +795,9 @@ static int ctx_disconnect(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_disconnect(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -684,7 +831,9 @@ static int ctx_publish(lua_State *L)
 	int qos = luaL_optinteger(L, 4, 0);
 	bool retain = lua_toboolean(L, 5);
 
+	mlua_do_unlock();
 	int rc = mosquitto_publish(ctx->mosq, &mid, topic, payloadlen, payload, qos, retain);
+	mlua_do_lock();
 
 	if (rc != MOSQ_ERR_SUCCESS) {
 		return mosq__pstatus(L, rc);
@@ -713,7 +862,9 @@ static int ctx_subscribe(lua_State *L)
 	const char *sub = luaL_checkstring(L, 2);
 	int qos = luaL_optinteger(L, 3, 0);
 
+	mlua_do_unlock();
 	int rc = mosquitto_subscribe(ctx->mosq, &mid, sub, qos);
+	mlua_do_lock();
 
 	if (rc != MOSQ_ERR_SUCCESS) {
 		return mosq__pstatus(L, rc);
@@ -740,7 +891,9 @@ static int ctx_unsubscribe(lua_State *L)
 	int mid;
 	const char *sub = luaL_checkstring(L, 2);
 
+	mlua_do_unlock();
 	int rc = mosquitto_unsubscribe(ctx->mosq, &mid, sub);
+	mlua_do_lock();
 
 	if (rc != MOSQ_ERR_SUCCESS) {
 		return mosq__pstatus(L, rc);
@@ -756,11 +909,13 @@ static int mosq_loop(lua_State *L, bool forever)
 	int timeout = luaL_optinteger(L, 2, -1);
 	int max_packets = luaL_optinteger(L, 3, 1);
 	int rc;
+	mlua_do_unlock();
 	if (forever) {
 		rc = mosquitto_loop_forever(ctx->mosq, timeout, max_packets);
 	} else {
 		rc = mosquitto_loop(ctx->mosq, timeout, max_packets);
 	}
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -812,7 +967,9 @@ static int ctx_loop_start(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_loop_start(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -831,7 +988,9 @@ static int ctx_loop_stop(lua_State *L)
 	ctx_t *ctx = ctx_check(L, 1);
 	bool force = lua_toboolean(L, 2);
 
+	mlua_do_unlock();
 	int rc = mosquitto_loop_stop(ctx->mosq, force);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -846,7 +1005,9 @@ static int ctx_socket(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int fd = mosquitto_socket(ctx->mosq);
+	mlua_do_lock();
 	switch (fd) {
 		case -1:
 			lua_pushboolean(L, false);
@@ -875,7 +1036,9 @@ static int ctx_loop_read(lua_State *L)
 	ctx_t *ctx = ctx_check(L, 1);
 	int max_packets = luaL_optinteger(L, 2, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_loop_read(ctx->mosq, max_packets);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -895,7 +1058,9 @@ static int ctx_loop_write(lua_State *L)
 	ctx_t *ctx = ctx_check(L, 1);
 	int max_packets = luaL_optinteger(L, 2, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_loop_write(ctx->mosq, max_packets);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -913,7 +1078,9 @@ static int ctx_loop_misc(lua_State *L)
 {
 	ctx_t *ctx = ctx_check(L, 1);
 
+	mlua_do_unlock();
 	int rc = mosquitto_loop_misc(ctx->mosq);
+	mlua_do_lock();
 	return mosq__pstatus(L, rc);
 }
 
@@ -925,9 +1092,13 @@ static int ctx_loop_misc(lua_State *L)
  */
 static int ctx_want_write(lua_State *L)
 {
+	int ret;
 	ctx_t *ctx = ctx_check(L, 1);
 
-	lua_pushboolean(L, mosquitto_want_write(ctx->mosq));
+	mlua_do_unlock();
+	ret = mosquitto_want_write(ctx->mosq);
+	mlua_do_lock();
+	lua_pushboolean(L, ret);
 	return 1;
 }
 
@@ -971,6 +1142,7 @@ static void ctx_on_connect(
 			break;
 	}
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_connect);
 
 	lua_pushboolean(ctx->L, success);
@@ -978,6 +1150,7 @@ static void ctx_on_connect(
 	lua_pushstring(ctx->L, str);
 
 	lua_call(ctx->L, 3, 0);
+	mlua_do_unlock();
 }
 
 
@@ -995,6 +1168,7 @@ static void ctx_on_disconnect(
 		str = "unexpected disconnect";
 	}
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_disconnect);
 
 	lua_pushboolean(ctx->L, success);
@@ -1002,6 +1176,7 @@ static void ctx_on_disconnect(
 	lua_pushstring(ctx->L, str);
 
 	lua_call(ctx->L, 3, 0);
+	mlua_do_unlock();
 }
 
 static void ctx_on_publish(
@@ -1011,9 +1186,11 @@ static void ctx_on_publish(
 {
 	ctx_t *ctx = obj;
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_publish);
 	lua_pushinteger(ctx->L, mid);
 	lua_call(ctx->L, 1, 0);
+	mlua_do_unlock();
 }
 
 static void ctx_on_message(
@@ -1023,6 +1200,7 @@ static void ctx_on_message(
 {
 	ctx_t *ctx = obj;
 
+	mlua_do_lock();
 	/* push registered Lua callback function onto the stack */
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_message);
 	/* push function args */
@@ -1033,6 +1211,7 @@ static void ctx_on_message(
 	lua_pushboolean(ctx->L, msg->retain);
 
 	lua_call(ctx->L, 5, 0); /* args: mid, topic, payload, qos, retain */
+	mlua_do_unlock();
 }
 
 static void ctx_on_subscribe(
@@ -1045,6 +1224,7 @@ static void ctx_on_subscribe(
 	ctx_t *ctx = obj;
 	int i;
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_subscribe);
 	lua_pushinteger(ctx->L, mid);
 
@@ -1053,6 +1233,7 @@ static void ctx_on_subscribe(
 	}
 
 	lua_call(ctx->L, qos_count + 1, 0);
+	mlua_do_unlock();
 }
 
 static void ctx_on_unsubscribe(
@@ -1062,9 +1243,11 @@ static void ctx_on_unsubscribe(
 {
 	ctx_t *ctx = obj;
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_unsubscribe);
 	lua_pushinteger(ctx->L, mid);
 	lua_call(ctx->L, 1, 0);
+	mlua_do_unlock();
 }
 
 static void ctx_on_log(
@@ -1075,12 +1258,14 @@ static void ctx_on_log(
 {
 	ctx_t *ctx = obj;
 
+	mlua_do_lock();
 	lua_rawgeti(ctx->L, LUA_REGISTRYINDEX, ctx->on_log);
 
 	lua_pushinteger(ctx->L, level);
 	lua_pushstring(ctx->L, str);
 
 	lua_call(ctx->L, 2, 0);
+	mlua_do_unlock();
 }
 
 static int callback_type_from_string(const char *);
@@ -1103,6 +1288,7 @@ static int ctx_callback_set(lua_State *L)
 	/* pop the function from the stack and store it in the registry */
 	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
+	mlua_do_unlock();
 	switch (callback_type) {
 		case CONNECT:
 			ctx->on_connect = ref;
@@ -1146,6 +1332,7 @@ static int ctx_callback_set(lua_State *L)
 			luaL_argerror(L, 2, "not a proper callback type");
 			break;
 	}
+	mlua_do_lock();
 
 	return mosq__pstatus(L, MOSQ_ERR_SUCCESS);
 }
@@ -1268,6 +1455,7 @@ static const struct luaL_Reg R[] = {
 	{"cleanup",	mosq_cleanup},
 	{"__gc",	mosq_cleanup},
 	{"new",		mosq_new},
+	{"lock",	mosq_lock},
 	{"topic_matches_sub",mosq_topic_matches_sub},
 	{NULL,		NULL}
 };
@@ -1323,8 +1511,27 @@ static const struct luaL_Reg ctx_M[] = {
 
 int luaopen_mosquitto(lua_State *L)
 {
+	int ret;
+	pthread_mutexattr_t pmattr;
+
 	mosquitto_lib_init();
 	mosq_initialized = 1;
+
+	memset(&pmattr, 0, sizeof(pmattr));
+	ret = pthread_mutexattr_init(&pmattr);
+	if (ret == 0)
+		ret = pthread_mutexattr_settype(&pmattr, PTHREAD_MUTEX_ERRORCHECK);
+	if (ret == 0) {
+		memset(&glua_lock, 0, sizeof(glua_lock));
+		glua_lock.ml_enable = MLUA_LOCK_DISABLE;
+		ret = pthread_mutex_init(&glua_lock.ml_lock, &pmattr);
+	}
+	if (ret) {
+		fprintf(stderr, "Error, failed to initialize global lua lock: %d\n", ret);
+		fflush(stderr);
+		abort();
+	}
+	pthread_mutexattr_destroy(&pmattr);
 
 #ifdef LUA_ENVIRONINDEX
 	/* set private environment for this module */

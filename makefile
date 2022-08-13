@@ -13,7 +13,7 @@ LUA_LDFLAGS := $(shell $(PKGC) --libs-only-L $(LUAPKGC))
 
 CMOD = mosquitto.so
 OBJS = lua-mosquitto.o
-LIBS = -lmosquitto
+LIBS = -lmosquitto -lpthread
 CSTD = -std=gnu99
 
 OPT ?= -Os
