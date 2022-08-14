@@ -43,7 +43,7 @@
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
-
+#include <signal.h>
 #include <pthread.h>
 #include <mosquitto.h>
 
@@ -76,6 +76,79 @@ struct mlua_lock {
 	unsigned int ml_enable;
 	pthread_mutex_t ml_lock;
 };
+
+#ifndef MQTTMSG_MAX_NUM
+#define MQTTMSG_MAX_NUM 0x20
+#endif
+#define MQTTMSG_MAGIC 0x21525948
+
+struct mqtt_msg {
+	unsigned int mt_magic;
+	int mt_paylen;
+	int mt_qos;
+	int mt_retain;
+	const char * mt_topic;
+	const char * mt_payload;
+	struct mqtt_msg * mt_next;
+};
+
+static struct mqtt_msg * mqtt_msg_new(size_t tlen,
+	size_t plen, char * * ptopic, char * * payload)
+{
+	char * msgptr;
+	size_t msglen;
+	struct mqtt_msg * mmsg = NULL;
+
+	msglen = sizeof(*mmsg) + tlen + plen + 0x2;
+	mmsg = (struct mqtt_msg *) malloc(msglen);
+	if (mmsg == NULL) {
+		fprintf(stderr, "Error, system out of memory: %lu\n",
+			(unsigned long) msglen);
+		fflush(stderr);
+		return NULL;
+	}
+
+	msgptr = (char *) mmsg;
+	mmsg->mt_magic = MQTTMSG_MAGIC;
+	mmsg->mt_paylen = (int) plen;
+	mmsg->mt_qos = 0;
+	mmsg->mt_retain = 0;
+
+	msgptr += sizeof(*mmsg);
+	*ptopic = msgptr;
+	mmsg->mt_topic = msgptr;
+
+	msgptr += tlen + 1;
+	*payload = msgptr;
+	mmsg->mt_payload = msgptr;
+	mmsg->mt_next = NULL;
+	return mmsg;
+}
+
+static void mqtt_msg_free(struct mqtt_msg * msgs)
+{
+	while (msgs != NULL) {
+		struct mqtt_msg * next;
+		if (__builtin_expect(msgs->mt_magic != MQTTMSG_MAGIC, 0)) {
+			fprintf(stderr, "Error, invalid MQTTMSG magic: %#x\n",
+				msgs->mt_magic);
+			fflush(stderr);
+			abort();
+		}
+
+		next = msgs->mt_next;
+		msgs->mt_magic = 0;
+		msgs->mt_paylen = 0;
+		msgs->mt_qos = 0;
+		msgs->mt_retain = 0;
+		msgs->mt_topic = NULL;
+		msgs->mt_payload = NULL;
+		msgs->mt_next = NULL;
+		free(msgs);
+		msgs = next;
+	}
+}
+
 /* unique naming for userdata metatables */
 #define MOSQ_META_CTX	"mosquitto.ctx"
 
@@ -89,6 +162,15 @@ typedef struct {
 	int on_subscribe;
 	int on_unsubscribe;
 	int on_log;
+
+	/* For multi-thread operation: */
+	volatile int mt_loop;
+	int mt_msgcnt;
+	struct mqtt_msg * mt_last;
+	struct mqtt_msg * mt_msgs;
+	pthread_t mt_thread;
+	pthread_mutex_t mt_lock;
+	pthread_cond_t mt_cond;
 } ctx_t;
 
 static int mosq_initialized = 0;
@@ -144,17 +226,21 @@ static int mosq_lock(lua_State *L)
 {
 	int enabled;
 	int ntop, rval;
+	char lockbuf[32];
 	struct mlua_lock * mlock;
 
 	enabled = 0;
 	mlock = &glua_lock;
 	__atomic_load(&mlock->ml_enable, &enabled, MLUA_MEMORDER);
 
+	if (lua_checkstack(L, 3) == 0)
+		return 0;
+
 	/* check `ml_enable, which only has two possible values: */
 	if (enabled != MLUA_LOCK_DISABLE && enabled != MLUA_LOCK_ENABLED) {
 		fprintf(stderr, "Error, invalid lua lock: %#x\n", enabled);
 		fflush(stderr);
-		lua_pushboolean(L, 0);
+		lua_pushnil(L);
 		return 1;
 	}
 
@@ -180,12 +266,14 @@ static int mosq_lock(lua_State *L)
 			fprintf(stderr, "Error, failed to %s lua lock: %d\n",
 				dolock ? "acquire" : "release", ret);
 			fflush(stderr);
-			lua_pushboolean(L, 0);
+			lua_pushnil(L);
 			return 1;
 		}
 	}
 
-	lua_pushboolean(L, 1);
+	snprintf(lockbuf, sizeof(lockbuf), "0x%lx",
+		(unsigned long) &mlock->ml_lock);
+	lua_pushstring(L, lockbuf);
 	lua_pushboolean(L, rval);
 	return 2;
 }
@@ -317,6 +405,10 @@ static int mosq_cleanup(lua_State *L)
 
 static void ctx__on_init(ctx_t *ctx)
 {
+	int ret;
+	pthread_condattr_t cattr;
+	pthread_mutexattr_t mattr;
+
 	ctx->on_connect = LUA_REFNIL;
 	ctx->on_disconnect = LUA_REFNIL;
 	ctx->on_publish = LUA_REFNIL;
@@ -324,10 +416,80 @@ static void ctx__on_init(ctx_t *ctx)
 	ctx->on_subscribe = LUA_REFNIL;
 	ctx->on_unsubscribe = LUA_REFNIL;
 	ctx->on_log = LUA_REFNIL;
+
+	/* for multi-thread access */
+	ctx->mt_loop = 0;
+	ctx->mt_msgcnt = 0;
+	ctx->mt_last = NULL;
+	ctx->mt_msgs = NULL;
+	ctx->mt_thread = 0;
+	memset(&cattr, 0, sizeof(cattr));
+	memset(&mattr, 0, sizeof(mattr));
+
+	/* initialize mutex lock */
+	ret = pthread_mutexattr_init(&mattr);
+	if (ret == 0)
+		ret = pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
+	if (ret == 0) {
+		memset(&ctx->mt_lock, 0, sizeof(ctx->mt_lock));
+		ret = pthread_mutex_init(&ctx->mt_lock, &mattr);
+	}
+	if (ret != 0) {
+		fprintf(stderr, "Error, failed to initialize mutex lock: %d\n", ret);
+		fflush(stderr);
+	}
+	pthread_mutexattr_destroy(&mattr);
+
+	/* initialize condition variable */
+	ret = pthread_condattr_init(&cattr);
+	if (ret == 0)
+		ret = pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+	if (ret == 0) {
+		memset(&ctx->mt_cond, 0, sizeof(ctx->mt_cond));
+		ret = pthread_cond_init(&ctx->mt_cond, &cattr);
+	}
+	if (ret != 0) {
+		fprintf(stderr, "Error, failed to initialize condition variable: %d\n", ret);
+		fflush(stderr);
+	}
+	pthread_condattr_destroy(&cattr);
 }
 
 static void ctx__on_clear(ctx_t *ctx)
 {
+	int ret;
+
+	ctx->mt_loop = 0;
+	ctx->mt_msgcnt = 0;
+	if (ctx->mt_thread != 0) {
+		void * retval = NULL;
+		pthread_cancel(ctx->mt_thread);
+		ret = pthread_join(ctx->mt_thread, &retval);
+		if (ret) {
+			fprintf(stderr, "Error, failed to join thread %#lx: %d\n",
+				(unsigned long) ctx->mt_thread, ret);
+			fflush(stderr);
+		}
+		ctx->mt_thread = 0;
+	}
+
+	ret = pthread_mutex_destroy(&ctx->mt_lock);
+	if (ret) {
+		fprintf(stderr, "Error, failed to destroy mutex: %d\n", ret);
+		fflush(stderr);
+	}
+	ret = pthread_cond_destroy(&ctx->mt_cond);
+	if (ret) {
+		fprintf(stderr, "Error, failed to destroy condvar: %d\n", ret);
+		fflush(stderr);
+	}
+
+	ctx->mt_last = NULL;
+	if (ctx->mt_msgs != NULL) {
+		mqtt_msg_free(ctx->mt_msgs);
+		ctx->mt_msgs = NULL;
+	}
+
 	luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->on_connect);
 	luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->on_disconnect);
 	luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->on_publish);
@@ -901,6 +1063,303 @@ static int ctx_unsubscribe(lua_State *L)
 		lua_pushinteger(L, mid);
 		return 1;
 	}
+}
+
+static void * ctx_thread_func(void * _ctx)
+{
+	ctx_t * ctx;
+	int ret, locked, dummy;
+
+	locked = dummy = 0;
+	ctx = (ctx_t *) _ctx;
+	ret = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &dummy);
+	if (ret) {
+		fprintf(stderr, "Error, failed to set pthread cancel type: %d\n", ret);
+		fflush(stderr);
+		return NULL;
+	}
+
+	while (ctx->mt_loop != 0) {
+		int msgcnt, counter;
+		struct mqtt_msg * mtmsg;
+		struct mqtt_msg * mimsg;
+
+		dummy = 0;
+		/* Enable pthread cancallation point */
+		ret = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &dummy);
+		if (ret) {
+			fprintf(stderr, "Error, failed to enable cancel points: %d\n", ret);
+			fflush(stderr);
+			break;
+		}
+
+		/* acquire mutex lock */
+		ret = pthread_mutex_lock(&ctx->mt_lock);
+		if (ret) {
+			fprintf(stderr, "Error, failed to acquire mutex lock: %d\n", ret);
+			fflush(stderr);
+			break;
+		}
+		locked = 1;
+
+		mtmsg = ctx->mt_msgs;
+		while (mtmsg == NULL) {
+			struct timespec tsp;
+
+			tsp.tv_sec = 0;
+			tsp.tv_nsec = 0;
+			ret = clock_gettime(CLOCK_MONOTONIC, &tsp);
+			if (ret == -1) {
+				int error = errno;
+				fprintf(stderr, "Error, failed to get system boottime: %s\n",
+					strerror(error));
+				fflush(stderr);
+				break;
+			}
+
+			tsp.tv_sec += 300;
+			tsp.tv_nsec = 0;
+			ret = pthread_cond_timedwait(&ctx->mt_cond, &ctx->mt_lock, &tsp);
+			if (ctx->mt_loop == 0)
+				break;
+			if (ret == ETIMEDOUT) {
+				mtmsg = ctx->mt_msgs;
+				continue;
+			}
+			if (ret) {
+				fprintf(stderr, "Error, timedwait for condvar has failed: %d\n", ret);
+				fflush(stderr);
+				break;
+			}
+			mtmsg = ctx->mt_msgs;
+		}
+
+		/* if no MQTT messages found, just break out of loop */
+		if (mtmsg == NULL)
+			break;
+
+		dummy = 0;
+		/* disable pthread cancellation */
+		ret = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &dummy);
+		if (ret) {
+			fprintf(stderr, "Error, failed to disable cancel points: %d\n", ret);
+			fflush(stderr);
+			break;
+		}
+		msgcnt = ctx->mt_msgcnt;
+		ctx->mt_msgcnt = 0;
+		ctx->mt_last = NULL;
+		ctx->mt_msgs = NULL;
+
+		/* process MQTT messages with the mutex lock released */
+		ret = pthread_mutex_unlock(&ctx->mt_lock);
+		if (ret) {
+			mqtt_msg_free(mtmsg);
+			fprintf(stderr, "Error, failed to unlock mutex: %d\n", ret);
+			fflush(stderr);
+			break;
+		}
+		mimsg = mtmsg;
+		locked = counter = 0;
+		while (mimsg != NULL) {
+			int msgid = 0;
+
+			if (__builtin_expect(mimsg->mt_magic != MQTTMSG_MAGIC, 0)) {
+				fprintf(stderr, "Error, invalid mqtt_msg magic: %#x\n", mimsg->mt_magic);
+				fflush(stderr);
+				abort();
+			}
+			ret = mosquitto_publish(ctx->mosq, &msgid,
+				(const char *) mimsg->mt_topic, mimsg->mt_paylen,
+				(const void *) mimsg->mt_payload, mimsg->mt_qos, mimsg->mt_retain != 0);
+			if (ret != MOSQ_ERR_SUCCESS) {
+				fprintf(stderr, "Error, failed to publish MQTT message at index %d: %d\n",
+					counter, ret);
+				fflush(stderr);
+			}
+			counter++;
+			mimsg = mimsg->mt_next;
+		}
+		mqtt_msg_free(mtmsg);
+		if (__builtin_expect(msgcnt != counter, 0)) {
+			fprintf(stderr, "Error, invalid number of mqtt_msgs processed: %d <=> %d\n",
+				counter, msgcnt);
+			fflush(stderr);
+		}
+	}
+
+	dummy = 0;
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &dummy);
+	if (locked) {
+		ret = pthread_mutex_unlock(&ctx->mt_lock);
+		if (ret) {
+			fprintf(stderr, "Error, failed to unlock mutex: %d\n", ret);
+			fflush(stderr);
+		}
+	}
+	return NULL;
+}
+
+static int ctx_pubmsg1(ctx_t * ctx,
+	const char * topic, size_t tlen,
+	const char * payload, size_t plen,
+	int qos, int retain)
+{
+	int ret;
+	char * p_topic;
+	char * p_payload;
+	struct mqtt_msg * mtmsg;
+
+	p_topic = NULL;
+	p_payload = NULL;
+	mtmsg = mqtt_msg_new(tlen, plen, &p_topic, &p_payload);
+	if (mtmsg == NULL)
+		return -1;
+
+	if (tlen > 0)
+		memcpy(p_topic, topic, tlen);
+	p_topic[tlen] = '\0';
+	if (plen > 0)
+		memcpy(p_payload, payload, plen);
+	p_payload[plen] = '\0';
+
+	if (qos >= 0 && qos <= 2)
+		mtmsg->mt_qos = qos;
+	mtmsg->mt_retain = retain;
+
+	ret = pthread_mutex_lock(&ctx->mt_lock);
+	if (ret) {
+		mqtt_msg_free(mtmsg);
+		fprintf(stderr, "Error, failed to lock mutex: %d\n", ret);
+		fflush(stderr);
+		return -2;
+	}
+
+	if (__builtin_expect(ctx->mt_msgcnt >= MQTTMSG_MAX_NUM, 0)) {
+		mqtt_msg_free(mtmsg);
+		fprintf(stderr, "Error, MQTT message dropped: %s\n", topic);
+		fflush(stderr);
+	} else {
+		struct mqtt_msg * m_last;
+		m_last = ctx->mt_last;
+		if (m_last) {
+			ctx->mt_msgcnt++;
+			ctx->mt_last = mtmsg;
+			m_last->mt_next = mtmsg;
+		} else {
+			ctx->mt_msgcnt = 1;
+			ctx->mt_last = mtmsg;
+			ctx->mt_msgs = mtmsg;
+		}
+	}
+
+	ret = pthread_mutex_unlock(&ctx->mt_lock);
+	if (ret) {
+		fprintf(stderr, "Error, failed to unlock mutex: %d\n", ret);
+		fflush(stderr);
+		return -3;
+	}
+
+	ret = pthread_cond_signal(&ctx->mt_cond);
+	if (ret) {
+		fprintf(stderr, "Error, signal condvar has failed: %d\n", ret);
+		fflush(stderr);
+		return -4;
+	}
+	return 0;
+}
+
+static int ctx_pubmsg(lua_State * L)
+{
+	size_t tlen, plen;
+	const char * topic;
+	const char * payload;
+	int ntop, qos, retain, ret;
+	ctx_t * ctx = ctx_check(L, 1);
+
+	tlen = plen = 0;
+	qos = retain = 0;
+	topic = payload = NULL;
+	if (lua_checkstack(L, 2) == 0)
+		return 0;
+
+	ntop = lua_gettop(L);
+	if (ntop >= 2 && lua_type(L, 2) == LUA_TSTRING)
+		topic = lua_tolstring(L, 2, &tlen);
+	if (ntop >= 3 && lua_type(L, 3) == LUA_TSTRING)
+		payload = lua_tolstring(L, 3, &plen);
+	if (ntop >= 4 && lua_type(L, 4) == LUA_TNUMBER)
+		qos = (int) lua_tointeger(L, 4);
+	if (ntop >= 5 && lua_type(L, 5) == LUA_TBOOLEAN)
+		retain = lua_toboolean(L, 5);
+
+	if (tlen == 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "invalid zero length of topic");
+		return 2;
+	}
+
+	ret = ctx_pubmsg1(ctx, topic, tlen,
+		payload, plen, qos, retain);
+	if (ret < 0) {
+		lua_pushboolean(L, 0);
+		lua_pushstring(L, "failed to publish message");
+		return 2;
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+static int ctx_getptr(lua_State * L)
+{
+	int ret, ntop;
+	char buffer[64];
+	ctx_t * ctx = ctx_check(L, 1);
+
+	if (lua_checkstack(L, 2) == 0)
+		return 0;
+	if (ctx == NULL) {
+		lua_pushnil(L);
+		lua_pushstring(L, "invalid null mosquitto context");
+		return 2;
+	}
+
+	ntop = lua_gettop(L);
+	if (ntop >= 2 && lua_type(L, 2) == LUA_TBOOLEAN) {
+		int start = lua_toboolean(L, 2);
+		if (start && ctx->mt_thread == 0) {
+			ctx->mt_loop = -1;
+			ret = pthread_create(&ctx->mt_thread,
+				NULL, ctx_thread_func, ctx);
+			if (ret) {
+				lua_pushnil(L);
+				lua_pushfstring(L, "failed to create thread: %d", ret);
+				return 2;
+			}
+		}
+
+		if (start == 0 && ctx->mt_thread) {
+			void * rval = NULL;
+			ctx->mt_loop = 0;
+			pthread_cancel(ctx->mt_thread);
+			ret = pthread_join(ctx->mt_thread, &rval);
+			if (ret) {
+				fprintf(stderr, "Error, failed to join thread %#lx: %d\n",
+					(unsigned long) ctx->mt_thread, ret);
+				fflush(stderr);
+			}
+			ctx->mt_thread = 0;
+		}
+	}
+
+	memset(buffer, 0, sizeof(buffer));
+	ret = snprintf(buffer, sizeof(buffer), "0x%lx/0x%lx",
+		(unsigned long) ctx->mosq, (unsigned long) &ctx->mt_lock);
+	if (ret <= 0)
+		ret = (int) strlen(buffer);
+	lua_pushlstring(L, buffer, (size_t) ret);
+	lua_pushboolean(L, ctx->mt_thread && (pthread_kill(ctx->mt_thread, 0) == 0));
+	return 2;
 }
 
 static int mosq_loop(lua_State *L, bool forever)
@@ -1481,6 +1940,8 @@ static const struct luaL_Reg ctx_M[] = {
 	{"publish",			ctx_publish},
 	{"subscribe",		ctx_subscribe},
 	{"unsubscribe",		ctx_unsubscribe},
+	{"getptr",          ctx_getptr},
+	{"pubmsg",          ctx_pubmsg},
 	{"loop",			ctx_loop},
 	{"loop_forever",	ctx_loop_forever},
 	{"loop_start",		ctx_loop_start},
