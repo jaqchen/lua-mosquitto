@@ -212,6 +212,90 @@ static int mlua_lock_unlock(int dolock, int doabort)
 
 }
 
+static void pthread_mutex_destroy1(pthread_mutex_t * mut)
+{
+	int ret;
+
+	ret = pthread_mutex_destroy(mut);
+	if (ret == EBUSY) {
+		ret = pthread_mutex_consistent(mut);
+		if (ret) {
+			fprintf(stderr, "Error, failed to make mutex consistent: %d\n", ret);
+			fflush(stderr);
+		}
+		ret = pthread_mutex_unlock(mut);
+		if (ret) {
+			fprintf(stderr, "Error, failed to unlock mutex: %d\n", ret);
+			fflush(stderr);
+		} else
+			ret = pthread_mutex_destroy(mut);
+	}
+
+	if (ret) {
+		fprintf(stderr, "Error, failed to destroy mutex: %d\n", ret);
+		fflush(stderr);
+	}
+}
+
+static void pthread_cond_destroy1(pthread_cond_t * cond)
+{
+	int ret;
+	ret = pthread_cond_destroy(cond);
+	if (ret) {
+		fprintf(stderr, "Error, failed to destroy condvar: %d\n", ret);
+		fflush(stderr);
+	}
+}
+
+static int pthread_mutex_init1(pthread_mutex_t * mut)
+{
+	int ret;
+	pthread_mutexattr_t mattr;
+
+	memset(&mattr, 0, sizeof(mattr));
+	ret = pthread_mutexattr_init(&mattr);
+	if (ret == 0)
+		ret = pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
+	if (ret == 0)
+		ret = pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+	if (ret == 0) {
+		memset(mut, 0, sizeof(*mut));
+		/* initialize mutex lock: */
+		ret = pthread_mutex_init(mut, &mattr);
+	}
+	if (ret != 0) {
+		fprintf(stderr, "Error, failed to initialize mutex lock: %d\n", ret);
+		fflush(stderr);
+		return -1;
+	}
+	pthread_mutexattr_destroy(&mattr);
+	return 0;
+}
+
+static int pthread_cond_init1(pthread_cond_t * cond)
+{
+	int ret;
+	pthread_condattr_t cattr;
+
+	memset(&cattr, 0, sizeof(cattr));
+	ret = pthread_condattr_init(&cattr);
+	if (ret == 0)
+		ret = pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+	if (ret == 0) {
+		memset(cond, 0, sizeof(*cond));
+		/* initialize condition variable: */
+		ret = pthread_cond_init(cond, &cattr);
+	}
+	if (ret != 0) {
+		fprintf(stderr, "Error, failed to initialize condition variable: %d\n", ret);
+		fflush(stderr);
+		return -1;
+	}
+
+	pthread_condattr_destroy(&cattr);
+	return 0;
+}
+
 static int mlua_do_lock(void)
 {
 	return mlua_lock_unlock(1, 1);
@@ -405,10 +489,6 @@ static int mosq_cleanup(lua_State *L)
 
 static void ctx__on_init(ctx_t *ctx)
 {
-	int ret;
-	pthread_condattr_t cattr;
-	pthread_mutexattr_t mattr;
-
 	ctx->on_connect = LUA_REFNIL;
 	ctx->on_disconnect = LUA_REFNIL;
 	ctx->on_publish = LUA_REFNIL;
@@ -423,36 +503,9 @@ static void ctx__on_init(ctx_t *ctx)
 	ctx->mt_last = NULL;
 	ctx->mt_msgs = NULL;
 	ctx->mt_thread = 0;
-	memset(&cattr, 0, sizeof(cattr));
-	memset(&mattr, 0, sizeof(mattr));
 
-	/* initialize mutex lock */
-	ret = pthread_mutexattr_init(&mattr);
-	if (ret == 0)
-		ret = pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
-	if (ret == 0) {
-		memset(&ctx->mt_lock, 0, sizeof(ctx->mt_lock));
-		ret = pthread_mutex_init(&ctx->mt_lock, &mattr);
-	}
-	if (ret != 0) {
-		fprintf(stderr, "Error, failed to initialize mutex lock: %d\n", ret);
-		fflush(stderr);
-	}
-	pthread_mutexattr_destroy(&mattr);
-
-	/* initialize condition variable */
-	ret = pthread_condattr_init(&cattr);
-	if (ret == 0)
-		ret = pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-	if (ret == 0) {
-		memset(&ctx->mt_cond, 0, sizeof(ctx->mt_cond));
-		ret = pthread_cond_init(&ctx->mt_cond, &cattr);
-	}
-	if (ret != 0) {
-		fprintf(stderr, "Error, failed to initialize condition variable: %d\n", ret);
-		fflush(stderr);
-	}
-	pthread_condattr_destroy(&cattr);
+	pthread_cond_init1(&ctx->mt_cond);
+	pthread_mutex_init1(&ctx->mt_lock);
 }
 
 static void ctx__on_clear(ctx_t *ctx)
@@ -473,17 +526,8 @@ static void ctx__on_clear(ctx_t *ctx)
 		ctx->mt_thread = 0;
 	}
 
-	ret = pthread_mutex_destroy(&ctx->mt_lock);
-	if (ret) {
-		fprintf(stderr, "Error, failed to destroy mutex: %d\n", ret);
-		fflush(stderr);
-	}
-	ret = pthread_cond_destroy(&ctx->mt_cond);
-	if (ret) {
-		fprintf(stderr, "Error, failed to destroy condvar: %d\n", ret);
-		fflush(stderr);
-	}
-
+	pthread_mutex_destroy1(&ctx->mt_lock);
+	pthread_cond_destroy1(&ctx->mt_cond);
 	ctx->mt_last = NULL;
 	if (ctx->mt_msgs != NULL) {
 		mqtt_msg_free(ctx->mt_msgs);
@@ -1349,6 +1393,12 @@ static int ctx_getptr(lua_State * L)
 				fflush(stderr);
 			}
 			ctx->mt_thread = 0;
+
+			/* re-initialize mutex lock and condition variable */
+			pthread_mutex_destroy1(&ctx->mt_lock);
+			pthread_cond_destroy1(&ctx->mt_cond);
+			pthread_mutex_init1(&ctx->mt_lock);
+			pthread_cond_init1(&ctx->mt_cond);
 		}
 	}
 
